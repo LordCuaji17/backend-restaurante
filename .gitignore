@@ -1,0 +1,5 @@
+# Secretos y archivos locales
+.env
+*.bak
+backend-restaurante
+*.log
