@@ -585,6 +585,15 @@ func pagarOrden(c *gin.Context) {
 	}
 	totalFinal += propina
 
+	// Con tarjeta: primero se cobra en la terminal y se espera la aprobación.
+	// Si no se aprueba, la orden sigue abierta y no se imprime ningún ticket.
+	if req.MetodoPago == "Tarjeta" {
+		if err := cobrarEnTerminal(ordenID, totalFinal); err != nil {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
 	tx, err := db.Begin()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Error interno"})
@@ -604,22 +613,10 @@ func pagarOrden(c *gin.Context) {
 	tx.Commit()
 
 	var ticketErr string
-	// Imprime el ticket térmico de consumo con el detalle de platillos, propina y totales
+	// Imprime el ticket térmico (con tarjeta, solo llega aquí si el pago fue aprobado)
 	if req.Imprimir {
 		if err := procesarImpresion(ordenID, req.MetodoPago, totalFinal, propina); err != nil {
 			ticketErr = err.Error()
-		}
-	}
-
-	if req.MetodoPago == "Tarjeta" {
-		// Envía la orden de cobro a la pantalla de la terminal Point Smart
-		time.Sleep(500 * time.Millisecond)
-		if err := enviarCobroTerminal(ordenID, totalFinal); err != nil {
-			if ticketErr != "" {
-				ticketErr += " | " + err.Error()
-			} else {
-				ticketErr = err.Error()
-			}
 		}
 	}
 
@@ -660,23 +657,32 @@ func imprimirTicket(c *gin.Context) {
 	})
 }
 
-func enviarCobroTerminal(ordenID string, totalFinal float64) error {
+type ordenMP struct {
+	ID           string `json:"id"`
+	Status       string `json:"status"`
+	StatusDetail string `json:"status_detail"`
+	Errors       []struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
+// cobrarEnTerminal crea la orden de cobro en la Point Smart y espera hasta que
+// el cliente pague. Devuelve nil solo si el pago fue aprobado (status "processed").
+func cobrarEnTerminal(ordenID string, totalFinal float64) error {
 	accessToken := os.Getenv("MP_ACCESS_TOKEN")
 	deviceID := os.Getenv("MP_TERMINAL_ID")
 	if accessToken == "" || deviceID == "" {
 		return fmt.Errorf("faltan credenciales de Mercado Pago en variables de entorno")
 	}
 
-	idempotencyKey := fmt.Sprintf("pay-orden-%s-%d", ordenID, time.Now().UnixNano())
 	payload := map[string]interface{}{
 		"type":               "point",
-		"external_reference": fmt.Sprintf("orden-%s", ordenID),
+		"external_reference": fmt.Sprintf("orden-%s-%d", ordenID, time.Now().Unix()),
 		"description":        "Mariscos El Rinconcito",
 		"transactions": map[string]interface{}{
 			"payments": []map[string]interface{}{
-				{
-					"amount": fmt.Sprintf("%.2f", totalFinal),
-				},
+				{"amount": fmt.Sprintf("%.2f", totalFinal)},
 			},
 		},
 		"config": map[string]interface{}{
@@ -691,19 +697,60 @@ func enviarCobroTerminal(ordenID string, totalFinal float64) error {
 	req, _ := http.NewRequest("POST", "https://api.mercadopago.com/v1/orders", bytes.NewBuffer(jsonData))
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Idempotency-Key", idempotencyKey)
+	req.Header.Set("X-Idempotency-Key", fmt.Sprintf("pay-orden-%s-%d", ordenID, time.Now().UnixNano()))
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, clientErr := client.Do(req)
-	if clientErr != nil {
-		return clientErr
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("no se pudo contactar a Mercado Pago: %v", err)
 	}
-	defer resp.Body.Close()
+	var creada ordenMP
+	json.NewDecoder(resp.Body).Decode(&creada)
+	resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= 400 || creada.ID == "" {
+		if len(creada.Errors) > 0 && creada.Errors[0].Code == "already_queued_order_on_terminal" {
+			return fmt.Errorf("la terminal tiene otro cobro pendiente; cancélalo en la pantalla de la terminal e intenta de nuevo")
+		}
 		return fmt.Errorf("Mercado Pago rechazó el cobro en terminal (status %d)", resp.StatusCode)
 	}
-	return nil
+
+	// Espera a que el cliente pague (máx. 90 s; Render/Cloudflare cortan a ~100 s)
+	limite := time.Now().Add(90 * time.Second)
+	for time.Now().Before(limite) {
+		time.Sleep(2 * time.Second)
+
+		greq, _ := http.NewRequest("GET", "https://api.mercadopago.com/v1/orders/"+creada.ID, nil)
+		greq.Header.Set("Authorization", "Bearer "+accessToken)
+		gresp, gerr := client.Do(greq)
+		if gerr != nil {
+			continue
+		}
+		var o ordenMP
+		json.NewDecoder(gresp.Body).Decode(&o)
+		gresp.Body.Close()
+
+		switch o.Status {
+		case "processed":
+			return nil
+		case "failed":
+			return fmt.Errorf("el pago con tarjeta fue rechazado")
+		case "canceled":
+			return fmt.Errorf("el cobro fue cancelado en la terminal")
+		case "expired":
+			return fmt.Errorf("el cobro en la terminal expiró")
+		}
+	}
+
+	// Tiempo agotado: cancelar para no dejar la terminal bloqueada
+	creq, _ := http.NewRequest("POST", "https://api.mercadopago.com/v1/orders/"+creada.ID+"/cancel", nil)
+	creq.Header.Set("Authorization", "Bearer "+accessToken)
+	creq.Header.Set("X-Idempotency-Key", fmt.Sprintf("cancel-%s-%d", creada.ID, time.Now().UnixNano()))
+	creq.Header.Set("x-allow-cancelable-status", "at_terminal")
+	if cresp, cerr := client.Do(creq); cerr == nil {
+		cresp.Body.Close()
+	}
+	return fmt.Errorf("tiempo agotado esperando el pago con tarjeta; el cobro fue cancelado")
 }
 
 func procesarImpresion(ordenID string, metodoPago string, total float64, propina float64) error {
